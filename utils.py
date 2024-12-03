@@ -3,7 +3,17 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import warnings
+from functools import reduce
+import operator
+import os
+import copy
+
 import welib.fast.beamdyn as bd
+from welib.FEM.fem_beam import *
+from welib.beams.theory import *
+
+import ruamel.yaml as ry
+
 
 # try to import sectionproperties
 try:
@@ -60,6 +70,61 @@ except ImportError:
     sp_lib = False
     pass
 
+# helper functions
+
+def remove_numpy(fst_vt):
+    # recursively move through nested dictionary, remove numpy data types
+    # for formatting dictionaries before writing to yaml files
+    # from https://github.com/WISDEM/WEIS/blob/main/weis/aeroelasticse/FileTools.py#L19
+
+    def get_dict(vartree, branch):
+        return reduce(operator.getitem, branch, vartree)
+
+    def loop_dict(vartree, branch):
+        if type(vartree) is not dict:
+            return fst_vt
+        for var in vartree.keys():
+            branch_i = copy.copy(branch)
+            branch_i.append(var)
+            if type(vartree[var]) is dict:
+                loop_dict(vartree[var], branch_i)
+            else:
+                data_type = type(get_dict(fst_vt, branch_i[:-1])[branch_i[-1]])
+
+                if data_type in [np.int_, np.intc, np.intp, np.int8, np.int16, np.int32, np.int64, np.uint8, np.uint16, np.uint32, np.uint64]:
+                    get_dict(fst_vt, branch_i[:-1])[branch_i[-1]] = int(get_dict(fst_vt, branch_i[:-1])[branch_i[-1]])
+                elif data_type in [np.single, np.double, np.longdouble, np.csingle, np.cdouble, np.float16, np.float32, np.float64, np.complex64, np.complex128]:
+                    get_dict(fst_vt, branch_i[:-1])[branch_i[-1]] = float(get_dict(fst_vt, branch_i[:-1])[branch_i[-1]])
+                elif data_type in [np.bool_]:
+                    get_dict(fst_vt, branch_i[:-1])[branch_i[-1]] = bool(get_dict(fst_vt, branch_i[:-1])[branch_i[-1]])
+                elif data_type in [np.ndarray]:
+                    get_dict(fst_vt, branch_i[:-1])[branch_i[-1]] = get_dict(fst_vt, branch_i[:-1])[branch_i[-1]].tolist()
+                elif data_type in [list,tuple]:
+                    for item in get_dict(fst_vt, branch_i[:-1])[branch_i[-1]]:
+                        remove_numpy(item)
+
+    # set fast variables to update values
+    loop_dict(fst_vt, [])
+
+    return fst_vt
+
+def save_yaml(outdir, fname, data_out):
+    # from https://github.com/WISDEM/WEIS/blob/main/weis/aeroelasticse/FileTools.py#L123
+
+    if not os.path.isdir(outdir) and outdir!='':
+        os.makedirs(outdir)
+    fname = os.path.join(outdir, fname)
+
+    data_out = remove_numpy(data_out)
+
+    f = open(fname, "w")
+    yaml=ry.YAML()
+    yaml.default_flow_style = None
+    yaml.width = float("inf")
+    yaml.indent(mapping=4, sequence=6, offset=3)
+    yaml.dump(data_out, f)
+    f.close()
+
 class Shape:
     """Base class for all cross-sectional shapes"""
     def __init__(self):
@@ -87,26 +152,51 @@ class Shape:
         self.ky_sp = None
         self.section = None
 
+        # Frequency and mode shapes nested dictionary
+        self.freqModes = {'FEM': {}, 
+                        'Theory': {}}
+        
+    @property
+    def saveFolder(self):
+        return self._saveFolder
+
+
+    @saveFolder.setter
+    def saveFolder(self, folder):
+        self._saveFolder = folder
+        if not os.path.isdir(folder):
+            os.makedirs(folder)
+
     def getBeamDynMats(self, E, G, Nu, rho, secProp = True):
         # returns the stiffness and mass matrices for the crossection using beamdyn.py from welib
         # E: Young's modulus, G: Shear modulus, Nu: Poisson's ratio, rho: density
         # Choose properties based on secProp flag
-        area = self.area_sp if sp_lib else self.area
-        Ixx = self.Ixx_sp if sp_lib else self.Ixx
-        Iyy = self.Iyy_sp if sp_lib else self.Iyy
+
+        # Overide secProp if set to True and sectionproperties is not installed
+        secProp = secProp and sp_lib
+
+        # adding the material properties to the class
+        self.E = E
+        self.G = G
+        self.Nu = Nu
+        self.rho = rho
+
+        area = self.area_sp if secProp else self.area
+        Ixx = self.Ixx_sp if secProp else self.Ixx
+        Iyy = self.Iyy_sp if secProp else self.Iyy
         Ip = Ixx + Iyy
-        J = self.J_sp if sp_lib else self.J
-        kx = self.kx_sp if sp_lib else self.kx
-        ky = self.ky_sp if sp_lib else self.ky
+        J = self.J_sp if secProp else self.J
+        kx = self.kx_sp if secProp else self.kx
+        ky = self.ky_sp if secProp else self.ky
 
         # this will be in the section properties origin
-        elasticCentroid = self.section.get_c() if sp_lib else (0, 0)
+        elasticCentroid = self.section.get_c() if secProp else (0, 0)
         # convert to BeamDyn origin
         x_C = elasticCentroid[0] - self.sp2origin[0] 
         y_C = elasticCentroid[1] - self.sp2origin[1] 
-        theta_p = self.section.get_phi() if sp_lib else 0
+        theta_p = self.section.get_phi() if secProp else 0
 
-        shearCenter = self.section.get_sc() if sp_lib else (0, 0)
+        shearCenter = self.section.get_sc() if secProp else (0, 0)
         # convert to BeamDyn origin
         x_S = shearCenter[0] - self.sp2origin[0]
         y_S = shearCenter[1] - self.sp2origin[1]
@@ -145,11 +235,153 @@ class Shape:
                         theta_i = theta_i
                     )
         return self.KK, self.MM
+    
+    # Using cbeam and other functions from welib to extract expected frequency and mode shapes
+    def FreqAndModes(self,Length, nel=None, BC='clamped-free', element='frame3d', M_tip=None, secProp = True, nModes=10, plot=True):
+        # check if MM and KK are computed
+        if self.MM.all == None or self.KK.all == None:
+            warnings.warn("MM and KK matrices are not computed, use getBeamDynMats() to compute them", UserWarning)
+            return None, None, None
 
+        # verify if section properties is installed
+        secProp = secProp and sp_lib 
+
+        # --- Compute FEM model and mode shapes
+        FEM=cbeam(Length,
+                    m = (self.area_sp if secProp else self.area) * self.rho,
+                    EIx = self.E * (self.Ixx_sp if secProp else self.Ixx),
+                    EIy = self.E * (self.Iyy_sp if secProp else self.Iyy),
+                    EIz = self.E * ((self.Ixx_sp if secProp else self.Ixx) + (self.Iyy_sp if secProp else self.Iyy)),
+                    EA = self.E * (self.area_sp if secProp else self.area),
+                    A = (self.area_sp if secProp else self.area),
+                    E = self.E,
+                    G = self.G,
+                    Kt = (self.J_sp if secProp else self.J),
+                    element = element, 
+                    nel = nel, 
+                    BC = BC, 
+                    M_tip = M_tip)
+        
+        # Extract the first nModes mode shapes and arrange them in a dictionary
+        # cbeam assumes x along blade length, y along flapwise, z along edgewise
+
+        # Extracting the mode shapes based on common names
+        for idx,modeName in enumerate(FEM['modeNames']):
+            if modeName.startswith('uy'):
+                modeNameEasy = f'flapwise_{modeName[-1]}'
+                self.freqModes['FEM'][modeNameEasy] = {}
+                self.freqModes['FEM'][modeNameEasy]['xNodes'] = FEM['xNodes'][0,:] # assuming non curved beam
+                self.freqModes['FEM'][modeNameEasy]['modeShape'] = FEM['Q'][1::6, idx]
+                self.freqModes['FEM'][modeNameEasy]['frequency'] = FEM['freq'][idx]
+
+            if modeName.startswith('uz'):
+                modeNameEasy = f'edgewise_{modeName[-1]}'
+                self.freqModes['FEM'][modeNameEasy] = {}
+                self.freqModes['FEM'][modeNameEasy]['xNodes'] = FEM['xNodes'][0,:]
+                self.freqModes['FEM'][modeNameEasy]['modeShape'] = FEM['Q'][2::6, idx]
+                self.freqModes['FEM'][modeNameEasy]['frequency'] = FEM['freq'][idx]
+
+            if modeName.startswith('vx'):
+                modeNameEasy = f'torsional_{modeName[-1]}'
+                self.freqModes['FEM'][modeNameEasy] = {}
+                self.freqModes['FEM'][modeNameEasy]['xNodes'] = FEM['xNodes'][0,:]
+                self.freqModes['FEM'][modeNameEasy]['modeShape'] = FEM['Q'][3::6, idx]
+                self.freqModes['FEM'][modeNameEasy]['frequency'] = FEM['freq'][idx]
+
+        # --- Theory based on the beam bending modes - Falpwise
+        t_freq, t_x, t_q,_,_ = UniformBeamBendingModes(Type = 'unloaded-clamped-free',
+                                         EI = self.E * (self.Ixx_sp if secProp else self.Ixx),
+                                         rho = self.rho,
+                                         A = (self.area_sp if secProp else self.area),
+                                         L = Length,
+                                         nModes = 3)
+        
+        self.assignTheory(t_freq, t_x, t_q, 'flapwise')
+        
+        t_freq, t_x, t_q,_,_ = UniformBeamBendingModes(Type = 'unloaded-clamped-free',
+                                            EI = self.E * (self.Iyy_sp if secProp else self.Iyy),
+                                            rho = self.rho,
+                                            A = (self.area_sp if secProp else self.area),
+                                            L = Length,
+                                            nModes = 3)
+        
+        self.assignTheory(t_freq, t_x, t_q, 'edgewise')
+        
+        t_freq, t_x, t_q,_ = UniformBeamTorsionModes(Type = 'unloaded-clamped-free',
+                                                G = self.G,
+                                                Kt = self.J_sp if secProp else self.J,
+                                                Ip = (self.Ixx_sp if secProp else self.Ixx) + (self.Iyy_sp if secProp else self.Iyy),
+                                                rho = self.rho,
+                                                A = (self.area_sp if secProp else self.area),
+                                                L = Length,
+                                                nModes = 3)
+
+        self.assignTheory(t_freq, t_x, t_q, 'torsional')
+
+        if plot:
+
+            if self.saveFolder == None:
+                self.saveFolder = os.getcwd()
+
+            self.plotFreqAndModes(mode='flapwise', mNos=np.min((sum('uz' in x for x in FEM['modeNames']),3)))
+            self.plotFreqAndModes(mode='edgewise', mNos=np.min((sum('uy' in x for x in FEM['modeNames']),3)))
+            self.plotFreqAndModes(mode='torsional', mNos=np.min((sum('vx' in x for x in FEM['modeNames']),3)))
+
+        save_yaml(self.saveFolder, f'{self.__class__.__name__}_BeamFreqModes.yaml', self.freqModes)
+
+        return self.freqModes
+
+    def assignTheory(self, freqs, x, q, mode):
+
+        for idx, freq in enumerate(freqs):
+            modeName = f'{mode}_{idx+1}'
+            self.freqModes['Theory'][modeName] = {}
+            self.freqModes['Theory'][modeName]['xNodes'] = x
+            self.freqModes['Theory'][modeName]['frequency'] = freq
+            self.freqModes['Theory'][modeName]['modeShape'] = q[idx, :]
+
+
+
+    def plotFreqAndModes(self, mode='flapwise', mNos = 1, FEM=True, Theory=True):
+        # plot the frequency and mode shapes
+        fig,ax = plt.subplots(mNos, 1, sharex = True, figsize=(6.4,4.8*mNos)) # (6.4,4.8)
+
+        for i in range(mNos):
+            
+            modeName = f'{mode}_{i+1}'
+
+            if mNos == 1:
+                if FEM:
+                    ax.plot(self.freqModes['FEM'][modeName]['xNodes'], self.freqModes['FEM'][modeName]['modeShape'], 'b-', label=f'FEM @ {self.freqModes["FEM"][modeName]["frequency"]:.2f} Hz')
+                if Theory:
+                    ax.plot(self.freqModes['Theory'][modeName]['xNodes'], self.freqModes['Theory'][modeName]['modeShape'], 'k--', label=f'Theory @ {self.freqModes["Theory"][modeName]["frequency"]:.2f} Hz')
+            
+            else:
+                if FEM:
+                    ax[i].plot(self.freqModes['FEM'][modeName]['xNodes'], self.freqModes['FEM'][modeName]['modeShape'], 'b-', label=f'FEM @ {self.freqModes["FEM"][modeName]["frequency"]:.2f} Hz')
+                if Theory:
+                    ax[i].plot(self.freqModes['Theory'][modeName]['xNodes'], self.freqModes['Theory'][modeName]['modeShape'], 'k--', label=f'Theory @ {self.freqModes["Theory"][modeName]["frequency"]:.2f} Hz')
+                ax[i].set_ylabel('Deflection [-]')
+                ax[i].set_title(f'{mode} {i+1} of beam')
+                ax[i].legend()
+
+        if mNos == 1:
+            ax.set_xlabel('Beam span [-]')
+            ax.set_ylabel('Deflection [-]')
+            ax.set_title(f'{mode} of beam')
+            ax.legend()
+
+        else:
+            ax[-1].set_xlabel('Beam span [-]')
+
+
+        plt.savefig(f'{self.saveFolder}/{mode}_mode_shapes.png')
+        plt.close()
 
 
 class circle(Shape):
     def __init__(self, r, plot=False, mesh_size=0, v=0.33):
+        super().__init__()
         self.r = r
 
         self.area = np.pi*self.r**2
@@ -173,6 +405,7 @@ class circle(Shape):
 
 class rectangle(Shape):
     def __init__(self, b, h, plot=False, mesh_size=0, v=0.33):
+        super().__init__()
         # b: width or in x-axis, h: height, or in y-axis
         self.b = b
         self.h = h
@@ -202,6 +435,7 @@ class rectangle(Shape):
 
 class hollowCircle(Shape):
     def __init__(self, r, t, plot=False, mesh_size=0, v=0.33):
+        super().__init__()
         # r: outer radius, t: thickness
         self.r = r
         self.t = t
@@ -230,15 +464,24 @@ class hollowCircle(Shape):
     @property
     def kx(self):
         raise NotImplementedError("Shear coefficient kx is not implemented for hollow circular sections, use kx_sp instead")
+    
+    @kx.setter
+    def kx(self, value):
+        self._kx = None
 
     @property 
     def ky(self):
         raise NotImplementedError("Shear coefficient ky is not implemented for hollow circular sections, use kx_sp instead")
+    
+    @ky.setter
+    def ky(self, value):
+        self._ky = None
 
 
 
 class hollowRectangle(Shape):
     def __init__(self, b, h, t, plot=False, mesh_size=0, v=0.33):
+        super().__init__()
         # b: width or in x-axis, h: height, or in y-axis, t: thickness
         self.b = b
         self.h = h
@@ -273,17 +516,29 @@ class hollowRectangle(Shape):
         warnings.warn("The torsion constant (J) for hollow rectangular sections can have errors >0.04 consider using J_sp for more accurate results", UserWarning)
         return self._J
     
+    @J.setter
+    def J(self, value):
+        self._J = value
+    
     @property
     def kx(self):
         raise NotImplementedError("Shear coefficient kx is not implemented for hollow rectangular sections, use kx_sp instead")
-
+    
+    @kx.setter
+    def kx(self, value):
+        self._kx = None
+    
     @property 
     def ky(self):
         raise NotImplementedError("Shear coefficient ky is not implemented for hollow rectangular sections, use kx_sp instead")
     
+    @ky.setter
+    def ky(self, value):
+        self._ky = None
 
 class naca4_sym_airfoil(Shape):
     def __init__(self, naca='0012', chord=1, aero_center = 0.25, n_points=200, samplingStyle='cosine', plot=False, mesh_size=0, v=0.33):
+        super().__init__()
         # Generates coordinates for a symmetric NACA 00xx airfoil.
         # Args:
         #     naca: NACA 4-digit airfoil code, limiting to symmetric airfoils for now
@@ -312,6 +567,9 @@ class naca4_sym_airfoil(Shape):
         # reverse X so that we start from the trailing edge and end at the trailing edge
         self.x = np.concatenate([self.x[::-1][:-1], self.x])
         self.y = np.concatenate([-self.y[::-1][:-1], self.y])
+
+        self.kx = None
+        self.ky = None
 
         # Origin info
         self.origin = (0, 0)
